@@ -49,16 +49,30 @@ class SemanticBackdoorGNN(torch.nn.Module):
             num_node_features,
         )
 
-    def forward(self, data) -> torch.Tensor:
-        """Forward pass through the GCN.
+    def forward(self, x, edge_index=None, batch=None) -> torch.Tensor:
+        """Forward pass through the GNN.
+
+        Supports two calling conventions:
+        1. forward(data) — PyG Data object (standard)
+        2. forward(x, edge_index) — GNNExplainer compatibility
 
         Args:
-            data: PyG Data object with x, edge_index, and batch attributes.
+            x: Node feature matrix [N, num_features] or PyG Data object.
+            edge_index: Edge COO indices [2, E]. If None, x is treated as Data.
+            batch: Batch assignment vector [N]. If None, defaults to all zeros.
 
         Returns:
             Logit tensor of shape [num_graphs, 1].
         """
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+        # Handle both calling conventions
+        if edge_index is None:
+            # Called with Data object
+            data = x
+            x, edge_index, batch = data.x, data.edge_index, data.batch
+        else:
+            # Called with (x, edge_index) by GNNExplainer
+            if batch is None:
+                batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
 
         # Layer 1: 768 -> 256
         x = self.conv1(x, edge_index)
