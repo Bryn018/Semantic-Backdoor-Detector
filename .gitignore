@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dataset and raw graphs (large files)
+dataset/
+raw_graphs/
+
+# Joern temp files
+/tmp/cpg_*
+/tmp/dot_*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep these
+!model.pth
+!vocab.json
+!infer.py
+!train.py
+!generate_dataset.py
+!build_pyg_dataset.py
+!cpg_generator.py
+!gnn_model.py
+!test_samples/
