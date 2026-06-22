@@ -3,6 +3,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
+![Release](https://img.shields.io/github/v/release/Bryn018/Semantic-Backdoor-Detector)
 
 A Graph Neural Network tool that detects supply chain backdoors in Python packages by learning **semantic data flow patterns** from Code Property Graphs — not just signatures.
 
@@ -150,4 +151,6 @@ py4j>=0.10
 
 ## License
 
-MIT
+This project is licensed under the [MIT License](LICENSE).
+
+**Responsible Use Notice:** This tool is intended for defensive security research — detecting supply chain backdoors in dependencies, auditing your own codebases, and authorized red-team/blue-team exercises. It is NOT intended for evading detection of malicious code, unauthorized scanning, or any activity violating applicable laws. See [LICENSE](LICENSE) for the full terms and responsible use notice.
