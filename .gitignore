@@ -21,6 +21,9 @@ env/
 # Dataset and raw graphs (large files)
 dataset/
 raw_graphs/
+dataset_semantic.pt
+dataset.pt
+embedding_cache.json
 
 # Joern temp files
 /tmp/cpg_*
