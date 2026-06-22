@@ -1,0 +1,27 @@
+name: 'Semantic Backdoor Detector'
+description: 'Detects supply chain backdoors in Python files using Graph Neural Networks over Code Property Graphs'
+author: 'Semantic CPG Detector'
+
+inputs:
+  target-path:
+    description: 'Path to the Python file or directory to scan'
+    required: true
+    default: '.'
+
+outputs:
+  verdict:
+    description: 'MALICIOUS or BENIGN'
+  confidence:
+    description: 'Confidence percentage'
+  explanation-nodes:
+    description: 'JSON array of critical code elements'
+  explanation-flows:
+    description: 'JSON array of critical data flows'
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+
+branding:
+  icon: 'shield'
+  color: 'red'
