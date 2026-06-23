@@ -42,8 +42,12 @@ from embedder import embed_graph_nodes, get_embedding_dim, extract_node_text
 
 MODEL_PATH: Path = Path(__file__).parent / "model.pth"
 VOCAB_PATH: Path = Path(__file__).parent / "vocab.json"
-JOERN_DIR: Path = Path.home() / "bin" / "joern"
-JAVA_HOME = Path.home() / ".local" / "jdk" / "jdk-21.0.5+11"
+JOERN_DIR: Path = Path(
+    os.environ.get("JOERN_DIR", str(Path.home() / "bin" / "joern"))
+)
+JAVA_HOME = Path(
+    os.environ.get("JAVA_HOME", str(Path.home() / ".local" / "jdk" / "jdk-21.0.5+11"))
+)
 
 # Actionable node types — code elements a developer can act on
 ACTIONABLE_TYPES: set[str] = {"CALL", "IDENTIFIER", "LITERAL", "METHOD_PARAMETER_IN", "CONTROL_STRUCTURE"}
