@@ -17,8 +17,10 @@ Core API:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import logging
+import networkx as nx
 import os
 import re
 import shutil
@@ -68,26 +70,101 @@ def joern_env() -> dict[str, str]:
     return env
 
 
-def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
-    """Extract CPG from Python source, preferring lightweight backend and Joern as fallback."""
-    error_detail: str | None = None
-
+def _generate_cpg_locally(code_string: str) -> dict:
+    """Pure-Python CPG generation using ast + networkx."""
     try:
-        from lightweight_cpg import generate_cpg
-    except Exception:
-        generate_cpg = None  # type: ignore[assignment]
+        tree = ast.parse(code_string)
+    except SyntaxError as exc:
+        return {"nodes": [{"id": 0, "code": f"PARSE_ERROR: {exc}", "label": "UNKNOWN"}], "edges": []}
 
-    if generate_cpg is not None:
-        try:
-            code_string = py_file.read_text(encoding="utf-8")
-            graph = generate_cpg(code_string)
-            if graph and graph.get("nodes"):
-                with open(output_json, "w", encoding="utf-8") as f:
-                    json.dump(graph, f, indent=2)
-                return graph
-            error_detail = "lightweight CPG returned an empty graph"
-        except Exception:
-            error_detail = f"lightweight CPG failed:\n{traceback.format_exc()}"
+    graph = nx.DiGraph()
+    label_map = {
+        ast.FunctionDef: "METHOD", ast.AsyncFunctionDef: "METHOD", ast.ClassDef: "TYPE_DECL",
+        ast.Call: "CALL", ast.Name: "IDENTIFIER", ast.Constant: "LITERAL",
+        ast.arg: "METHOD_PARAMETER_IN", ast.If: "CONTROL_STRUCTURE", ast.For: "CONTROL_STRUCTURE",
+        ast.While: "CONTROL_STRUCTURE", ast.With: "CONTROL_STRUCTURE",
+        ast.Return: "RETURN", ast.Assign: "LOCAL", ast.AnnAssign: "LOCAL",
+        ast.Import: "IMPORT", ast.ImportFrom: "IMPORT", ast.Module: "MODULE",
+        ast.Attribute: "IDENTIFIER",
+    }
+    def _label(node: ast.AST) -> str:
+        for typ, label in label_map.items():
+            if isinstance(node, typ):
+                return label
+        return "UNKNOWN"
+
+    def _code(node: ast.AST) -> str:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return f"def {node.name}"
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                val = getattr(func.value, 'id', None) or ast.dump(func.value)
+                return f"{val}.{func.attr}"
+            if isinstance(func, ast.Name):
+                return func.id
+            return ast.dump(func)
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Constant):
+            return repr(node.value)
+        if isinstance(node, ast.Import):
+            return "import " + ", ".join(a.name for a in node.names)
+        if isinstance(node, ast.ImportFrom):
+            return f"from {node.module or ''} import " + ", ".join(a.name for a in node.names)
+        if isinstance(node, (ast.If, ast.For, ast.While, ast.With, ast.Return)):
+            return type(node).__name__.upper()
+        if isinstance(node, ast.Assign):
+            return ", ".join(t.id for t in node.targets if isinstance(t, ast.Name)) + " ="
+        if isinstance(node, ast.Attribute):
+            return f"{getattr(node.value, 'id', '?')}.{node.attr}"
+        return type(node).__name__
+
+    defs: dict[str, int] = {}
+
+    def add(parent_gid: int | None, node: ast.AST) -> int:
+        gid = len(graph.nodes)
+        label = _label(node)
+        code = _code(node)
+        graph.add_node(gid, id=gid, code=code, label=label)
+        if parent_gid is not None:
+            graph.add_edge(parent_gid, gid, label="AST")
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    defs[t.id] = gid
+        if isinstance(node, ast.FunctionDef):
+            defs[node.name] = gid
+        for child in ast.iter_child_nodes(node):
+            add(gid, child)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            def_gid = defs.get(node.id)
+            if def_gid is not None:
+                graph.add_edge(def_gid, gid, label="REACHES")
+        return gid
+
+    for top in tree.body:
+        add(None, top)
+
+    nodes = [{"id": n, "code": d.get("code", ""), "label": d.get("label", "UNKNOWN")} for n, d in graph.nodes(data=True)]
+    edges = [{"src": u, "dst": v, "label": d.get("label", "AST")} for u, v, d in graph.edges(data=True)]
+    return {"nodes": nodes, "edges": edges}
+
+
+def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
+    """Extract CPG from Python source, using pure-Python ast backend."""
+    try:
+        code_string = py_file.read_text(encoding="utf-8")
+    except Exception as exc:
+        return {"_cpg_error": f"failed to read source: {exc}"}
+
+    graph = _generate_cpg_locally(code_string)
+    if graph and graph.get("nodes"):
+        with open(output_json, "w", encoding="utf-8") as f:
+            json.dump(graph, f, indent=2)
+        return graph
+
+    return {"_cpg_error": "CPG generation produced no nodes"}
 
     pysrc2cpg = JOERN_DIR / "frontends" / "pysrc2cpg" / "bin" / "pysrc2cpg"
     joern_export = JOERN_DIR / "bin" / "joern-export"
