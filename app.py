@@ -41,8 +41,7 @@ iface = gr.Interface(
     inputs=gr.Textbox(lines=15, placeholder="Paste Python Code to Analyze...", label="Python Source Code"),
     outputs=gr.Textbox(lines=15, label="Analysis Result"),
     title="🔬 Semantic CPG Backdoor Detector",
-    description="Paste Python code below to analyze it for supply chain backdoor patterns using CodeBERT + Graph Neural Networks + GNNExplainer.\n\nInspired by real-world attacks like XZ Utils (CVE-2024-3094).",
-    allow_flagging="never"
+    description="Paste Python code below to analyze it for supply chain backdoor patterns using CodeBERT + Graph Neural Networks + GNNExplainer.\n\nInspired by real-world attacks like XZ Utils (CVE-2024-3094)."
 )
 
 if __name__ == "__main__":
