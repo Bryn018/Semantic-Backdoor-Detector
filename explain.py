@@ -139,19 +139,17 @@ def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
 # Core Analysis API
 # ---------------------------------------------------------------------------
 
-
-def analyze_code(file_path: str) -> dict:
+def analyze_code(file_path_or_code: str) -> dict:
     """Analyze a Python file for backdoor patterns with full explainability.
 
     Extracts a Code Property Graph, embeds nodes with CodeBERT, runs the
     SemanticBackdoorGNN, and uses GNNExplainer to identify the specific
     code elements that drove the verdict.
 
-    Only actionable node types (CALL, IDENTIFIER, LITERAL, METHOD_PARAMETER_IN)
-    with meaningful mask scores (> 0.4) are included in the explanation.
+    Accepts either a file path (CLI) or raw Python code string (Gradio UI).
 
     Args:
-        file_path: Path to the Python source file to analyze.
+        file_path_or_code: Path to the Python source file, OR raw Python code string.
 
     Returns:
         A dictionary with the exact structure:
@@ -168,170 +166,172 @@ def analyze_code(file_path: str) -> dict:
             ]
         }
     """
-    py_file = Path(file_path).resolve()
-    if not py_file.is_file():
-        return {
-            "verdict": "ERROR",
-            "confidence": 0.0,
-            "explanation_nodes": [],
-            "explanation_flows": [f"File not found: {file_path}"],
-        }
+    temp_py_path = None
 
-    # Load model
-    with open(VOCAB_PATH, "r", encoding="utf-8") as f:
-        vocab = json.load(f)
+    # Check if input is a file path or raw code string
+    if os.path.exists(file_path_or_code) and file_path_or_code.endswith('.py'):
+        py_file = Path(file_path_or_code)
+    else:
+        # Input is raw code from Gradio UI, save to temp file
+        temp_py = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
+        temp_py.write(file_path_or_code)
+        temp_py.close()
+        temp_py_path = temp_py.name
+        py_file = Path(temp_py_path)
 
-    model = SemanticBackdoorGNN(get_embedding_dim())
-    model.load_state_dict(torch.load(str(MODEL_PATH), weights_only=True))
-    model.eval()
-
-    # Extract CPG
-    tmp_json = Path(tempfile.gettempdir()) / f"cpg_analyze_{os.getpid()}.json"
     try:
-        graph = extract_cpg(py_file, tmp_json)
-    finally:
-        if tmp_json.is_file():
-            tmp_json.unlink()
+        # Load model
+        with open(VOCAB_PATH, "r", encoding="utf-8") as f:
+            vocab = json.load(f)
 
-    if graph is None:
-        return {
-            "verdict": "ERROR",
-            "confidence": 0.0,
-            "explanation_nodes": [],
-            "explanation_flows": ["CPG extraction failed"],
+        model = SemanticBackdoorGNN(get_embedding_dim())
+        model.load_state_dict(torch.load(str(MODEL_PATH), weights_only=True))
+        model.eval()
+
+        # Extract CPG
+        tmp_json = Path(tempfile.gettempdir()) / f"cpg_analyze_{os.getpid()}.json"
+        try:
+            graph = extract_cpg(py_file, tmp_json)
+        finally:
+            if tmp_json.is_file():
+                tmp_json.unlink()
+
+        if graph is None:
+            return {
+                "verdict": "ERROR",
+                "confidence": 0.0,
+                "explanation_nodes": [],
+                "explanation_flows": ["CPG extraction failed"],
+            }
+
+        # Build PyG Data + mappings
+        embed_dim = get_embedding_dim()
+        x_np = embed_graph_nodes(graph)
+        x = torch.from_numpy(x_np).float()
+
+        # Build mappings
+        index_to_code: dict[int, str] = {}
+        index_to_label: dict[int, str] = {}
+        id_map: dict[int, int] = {}
+        for idx, node in enumerate(graph["nodes"]):
+            nid = int(node.get("id", idx))
+            id_map[nid] = idx
+            index_to_code[idx] = extract_node_text(node)
+            index_to_label[idx] = node.get("label", "UNKNOWN")
+
+        src_list, dst_list = [], []
+        for edge in graph["edges"]:
+            s = int(edge.get("src", -1))
+            d = int(edge.get("dst", -1))
+            if s in id_map and d in id_map:
+                src_list.append(id_map[s])
+                dst_list.append(id_map[d])
+
+        if not src_list:
+            src_list = list(range(len(graph["nodes"])))
+            dst_list = list(range(len(graph["nodes"])))
+
+        edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
+        y = torch.tensor([0], dtype=torch.long)
+        data = Data(x=x, edge_index=edge_index, y=y)
+
+        # Inference
+        with torch.no_grad():
+            logit = model(data)
+            probability = torch.sigmoid(logit).item()
+
+        verdict = "MALICIOUS" if probability >= 0.5 else "BENIGN"
+        confidence = max(probability, 1.0 - probability) * 100
+
+        # GNNExplainer
+        explainer_config = ExplainerConfig(
+            explanation_type="model",
+            node_mask_type="object",
+            edge_mask_type="object",
+        )
+        model_config = ModelConfig(
+            mode="binary_classification",
+            task_level="graph",
+            return_type="raw",
+        )
+        explainer = GNNExplainer(epochs=100)
+        explainer.connect(explainer_config, model_config)
+        explanation = explainer(
+            model=model,
+            x=data.x,
+            edge_index=data.edge_index,
+            target=data.y,
+        )
+        node_mask = explanation.node_mask
+        edge_mask = explanation.edge_mask
+        if node_mask.dim() > 1:
+            node_mask = node_mask.squeeze(-1)
+        if edge_mask.dim() > 1:
+            edge_mask = edge_mask.squeeze(-1)
+
+        # --- FILTER: Only actionable nodes with score > 0.25 ---
+        actionable_nodes: list[dict] = []
+        actionable_indices: set[int] = set()
+
+        for idx in range(len(graph["nodes"])):
+            label = index_to_label.get(idx, "")
+            score = node_mask[idx].item()
+
+            if label not in ACTIONABLE_TYPES:
+                continue
+            if score <= 0.25:
+                continue
+
+            code_str = index_to_code.get(idx, "")
+            if not code_str or code_str in ("?", "", "<empty>", "<module>", "<global>"):
+                continue
+            if len(code_str.strip()) < 2:
+                continue
+
+            actionable_nodes.append({
+                "index": idx,
+                "score": round(score, 4),
+                "code": code_str,
+                "type": label,
+            })
+            actionable_indices.add(idx)
+
+        actionable_nodes.sort(key=lambda n: n["score"], reverse=True)
+        top_nodes = actionable_nodes[:3]
+
+        # --- FILTER: Only edges where BOTH src and dst are actionable ---
+        explanation_flows: list[str] = []
+        if edge_mask.dim() == 1:
+            for e_idx in range(edge_mask.size(0)):
+                score = edge_mask[e_idx].item()
+                if score <= 0.3:
+                    continue
+                if e_idx < data.edge_index.size(1):
+                    src_idx = data.edge_index[0, e_idx].item()
+                    dst_idx = data.edge_index[1, e_idx].item()
+                    if src_idx in actionable_indices and dst_idx in actionable_indices:
+                        src_code = index_to_code.get(src_idx, "?")
+                        dst_code = index_to_code.get(dst_idx, "?")
+                        explanation_flows.append(
+                            f"{src_code} flows into {dst_code}"
+                        )
+
+        result: dict = {
+            "verdict": verdict,
+            "confidence": round(confidence, 1),
+            "explanation_nodes": [
+                {"score": n["score"], "code": n["code"], "type": n["type"]}
+                for n in top_nodes
+            ],
+            "explanation_flows": explanation_flows[:5],
         }
 
-    # Build PyG Data + mappings
-    embed_dim = get_embedding_dim()
-    x_np = embed_graph_nodes(graph)
-    x = torch.from_numpy(x_np).float()
+        return result
 
-    # Build mappings
-    index_to_code: dict[int, str] = {}
-    index_to_label: dict[int, str] = {}
-    id_map: dict[int, int] = {}
-    for idx, node in enumerate(graph["nodes"]):
-        nid = int(node.get("id", idx))
-        id_map[nid] = idx
-        index_to_code[idx] = extract_node_text(node)
-        index_to_label[idx] = node.get("label", "UNKNOWN")
+    finally:
+        if temp_py_path and os.path.exists(temp_py_path):
+            os.remove(temp_py_path)
 
-    src_list, dst_list = [], []
-    for edge in graph["edges"]:
-        s = int(edge.get("src", -1))
-        d = int(edge.get("dst", -1))
-        if s in id_map and d in id_map:
-            src_list.append(id_map[s])
-            dst_list.append(id_map[d])
-
-    if not src_list:
-        src_list = list(range(len(graph["nodes"])))
-        dst_list = list(range(len(graph["nodes"])))
-
-    edge_index = torch.tensor([src_list, dst_list], dtype=torch.long)
-    y = torch.tensor([0], dtype=torch.long)
-    data = Data(x=x, edge_index=edge_index, y=y)
-
-    # Inference
-    with torch.no_grad():
-        logit = model(data)
-        probability = torch.sigmoid(logit).item()
-
-    verdict = "MALICIOUS" if probability >= 0.5 else "BENIGN"
-    confidence = max(probability, 1.0 - probability) * 100
-
-    # GNNExplainer
-    explainer_config = ExplainerConfig(
-        explanation_type="model",
-        node_mask_type="object",
-        edge_mask_type="object",
-    )
-    model_config = ModelConfig(
-        mode="binary_classification",
-        task_level="graph",
-        return_type="raw",
-    )
-    explainer = GNNExplainer(epochs=100)
-    explainer.connect(explainer_config, model_config)
-    explanation = explainer(
-        model=model,
-        x=data.x,
-        edge_index=data.edge_index,
-        target=data.y,
-    )
-    node_mask = explanation.node_mask
-    edge_mask = explanation.edge_mask
-    # Squeeze masks to 1D if needed
-    if node_mask.dim() > 1:
-        node_mask = node_mask.squeeze(-1)
-    if edge_mask.dim() > 1:
-        edge_mask = edge_mask.squeeze(-1)
-
-    # --- FILTER: Only actionable nodes with score > 0.4 ---
-    actionable_nodes: list[dict] = []
-    actionable_indices: set[int] = set()
-
-    for idx in range(len(graph["nodes"])):
-        label = index_to_label.get(idx, "")
-        score = node_mask[idx].item()
-
-        if label not in ACTIONABLE_TYPES:
-            continue
-        if score <= 0.25:
-            continue
-
-        code_str = index_to_code.get(idx, "")
-        if not code_str or code_str in ("?", "", "<empty>", "<module>", "<global>"):
-            continue
-        if len(code_str.strip()) < 2:
-            continue
-
-        actionable_nodes.append({
-            "index": idx,
-            "score": round(score, 4),
-            "code": code_str,
-            "type": label,
-        })
-        actionable_indices.add(idx)
-
-    # Sort by score descending, take top 3
-    actionable_nodes.sort(key=lambda n: n["score"], reverse=True)
-    top_nodes = actionable_nodes[:3]
-
-    # --- FILTER: Only edges where BOTH src and dst are actionable ---
-    explanation_flows: list[str] = []
-    if edge_mask.dim() == 1:
-        for e_idx in range(edge_mask.size(0)):
-            score = edge_mask[e_idx].item()
-            if score <= 0.3:
-                continue
-            if e_idx < data.edge_index.size(1):
-                src_idx = data.edge_index[0, e_idx].item()
-                dst_idx = data.edge_index[1, e_idx].item()
-                if src_idx in actionable_indices and dst_idx in actionable_indices:
-                    src_code = index_to_code.get(src_idx, "?")
-                    dst_code = index_to_code.get(dst_idx, "?")
-                    explanation_flows.append(
-                        f"{src_code} flows into {dst_code}"
-                    )
-
-    # Build result dict — limit flows to top 5
-    result: dict = {
-        "verdict": verdict,
-        "confidence": round(confidence, 1),
-        "explanation_nodes": [
-            {"score": n["score"], "code": n["code"], "type": n["type"]}
-            for n in top_nodes
-        ],
-        "explanation_flows": explanation_flows[:5],
-    }
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# CLI Output
-# ---------------------------------------------------------------------------
 
 
 def print_banner() -> None:
