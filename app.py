@@ -20,7 +20,7 @@ def run_analysis(code_input):
             return f"⚠️ ANALYSIS ERROR\n\n{error_msg}"
         
         verdict = result.get("verdict", "UNKNOWN")
-        confidence = result.get("confidence", 0.0) * 100
+        confidence = result.get("confidence", 0.0)
         nodes = result.get("explanation_nodes", [])
         flows = result.get("explanation_flows", [])
         
