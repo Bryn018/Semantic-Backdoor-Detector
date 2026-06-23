@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -64,13 +65,33 @@ def joern_env() -> dict[str, str]:
 
 
 def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
-    """Extract CPG from Python file using pysrc2cpg + joern-export."""
+    """Extract CPG from Python source, preferring lightweight backend and Joern as fallback."""
+    error_detail: str | None = None
+
+    try:
+        from lightweight_cpg import generate_cpg
+    except Exception:
+        generate_cpg = None  # type: ignore[assignment]
+
+    if generate_cpg is not None:
+        try:
+            code_string = py_file.read_text(encoding="utf-8")
+            graph = generate_cpg(code_string)
+            if graph and graph.get("nodes"):
+                with open(output_json, "w", encoding="utf-8") as f:
+                    json.dump(graph, f, indent=2)
+                return graph
+            error_detail = "lightweight CPG returned an empty graph"
+        except Exception:
+            error_detail = f"lightweight CPG failed:\n{traceback.format_exc()}"
+
     pysrc2cpg = JOERN_DIR / "frontends" / "pysrc2cpg" / "bin" / "pysrc2cpg"
     joern_export = JOERN_DIR / "bin" / "joern-export"
 
     if not pysrc2cpg.is_file():
-        logger.error("pysrc2cpg not found at %s", pysrc2cpg)
-        return None
+        msg = f"Joern pysrc2cpg not found at {pysrc2cpg}"
+        logger.error(msg)
+        return {"_cpg_error": msg}
 
     tmp_cpg = Path(tempfile.gettempdir()) / f"cpg_explain_{os.getpid()}.bin"
     export_dir = Path(tempfile.gettempdir()) / f"dot_explain_{os.getpid()}"
@@ -86,8 +107,9 @@ def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
             capture_output=True, text=True, timeout=120, env=joern_env(),
         )
         if result.returncode != 0 or not tmp_cpg.is_file():
-            logger.error("pysrc2cpg failed")
-            return None
+            logger.error("pysrc2cpg failed: %s", result.stderr[:200])
+            error_detail = f"pysrc2cpg failed:\n{result.stderr}"
+            return {"_cpg_error": error_detail}
 
         result = subprocess.run(
             [str(joern_export), str(tmp_cpg), "--out", str(export_dir),
@@ -96,8 +118,9 @@ def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
             cwd=str(joern_export.parent), env=joern_env(),
         )
         if result.returncode != 0:
-            logger.error("joern-export failed")
-            return None
+            logger.error("joern-export failed: %s", result.stderr[:200])
+            error_detail = f"joern-export failed:\n{result.stderr}"
+            return {"_cpg_error": error_detail}
 
         all_nodes: dict[int, dict] = {}
         all_edges: list[dict] = []
@@ -127,9 +150,8 @@ def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
         return graph
 
     except (subprocess.TimeoutExpired, OSError) as exc:
-        import traceback
-        error_msg = f"CPG extraction failed:\n{traceback.format_exc()}"
-        return {"_cpg_error": error_msg}
+        msg = f"{'Joern' if error_detail is None else 'CPG'} extraction failed:\n{traceback.format_exc()}"
+        return {"_cpg_error": msg}
     finally:
         if tmp_cpg.is_file():
             tmp_cpg.unlink()
