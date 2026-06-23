@@ -10,7 +10,13 @@ def run_analysis(code_input):
         result = analyze_code(code_input)
         
         if result.get("verdict") == "ERROR":
-            error_msg = result.get("explanation_nodes", [{"code": "Unknown error"}])[0].get("code", "Unknown error")
+            nodes = result.get("explanation_nodes", [])
+            flows = result.get("explanation_flows", [])
+            error_msg = "Unknown error"
+            if nodes and "code" in nodes[0]:
+                error_msg = nodes[0]["code"]
+            elif flows:
+                error_msg = "\n".join(flows)
             return f"⚠️ ANALYSIS ERROR\n\n{error_msg}"
         
         verdict = result.get("verdict", "UNKNOWN")
