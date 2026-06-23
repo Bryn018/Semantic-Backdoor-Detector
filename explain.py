@@ -126,8 +126,10 @@ def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
             json.dump(graph, f, indent=2)
         return graph
 
-    except (subprocess.TimeoutExpired, OSError):
-        return None
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        import traceback
+        error_msg = f"CPG extraction failed:\n{traceback.format_exc()}"
+        return {"_cpg_error": error_msg}
     finally:
         if tmp_cpg.is_file():
             tmp_cpg.unlink()
@@ -196,12 +198,13 @@ def analyze_code(file_path_or_code: str) -> dict:
             if tmp_json.is_file():
                 tmp_json.unlink()
 
-        if graph is None:
+        if graph is None or (isinstance(graph, dict) and "_cpg_error" in graph):
+            error_msg = graph.get("_cpg_error", "CPG extraction failed") if isinstance(graph, dict) else "CPG extraction failed"
             return {
                 "verdict": "ERROR",
                 "confidence": 0.0,
                 "explanation_nodes": [],
-                "explanation_flows": ["CPG extraction failed"],
+                "explanation_flows": [error_msg],
             }
 
         # Build PyG Data + mappings
