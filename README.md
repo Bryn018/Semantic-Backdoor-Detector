@@ -12,40 +12,41 @@ Inspired by real-world attacks like **[XZ Utils](https://en.wikipedia.org/wiki/X
 ## How it Works
 
 ```
-Source Code → Code Property Graph (CPG) → 3-Layer GCN → Malicious / Benign
+Source Code → Code Property Graph (CPG) → CodeBERT Embeddings → GNN → Malicious / Benign
 ```
 
-1. **Code Property Graph (CPG)** — Joern parses the Python source into a unified graph representation combining AST, control flow, and data flow
-2. **Graph Convolutional Network** — A 3-layer GCN (16→64→32→16) learns structural patterns characteristic of backdoor code: base64 decoding → `os.system()`, reverse shell setup, cron persistence, data exfiltration
-3. **Verdict** — Sigmoid output gives a probability; ≥0.5 is MALICIOUS
+1. **Code Property Graph (CPG)** — Python source is parsed into a graph combining AST, control flow, and data flow
+2. **CodeBERT Embeddings** — Each CPG node is embedded into a 768-dim vector using `microsoft/codebert-base`
+3. **Graph Neural Network** — A 3-layer GCN (768 → 256 → 64 → 1) learns structural patterns characteristic of backdoor code: base64 decoding → `os.system()`, reverse shell setup, cron persistence, data exfiltration
+4. **Verdict** — Sigmoid output gives a probability; ≥0.5 is MALICIOUS
+5. **GNNExplainer** — Highlights the specific nodes and data flows that drove the verdict
 
 ## Architecture
 
 ```
-┌─────────────────┐     ┌──────────┐     ┌────────────┐     ┌──────────┐
-│  Python Source   │────▶│  Joern   │────▶│  PyG Data  │────▶│  GCN     │
-│  (.py file)      │     │  CPG     │     │  Object    │     │  Layers  │
-└─────────────────┘     └──────────┘     └────────────┘     └────┬─────┘
-                                                                  │
-                                                     ┌────────────▼────┐
-                                                     │  Sigmoid Output  │
-                                                     │  P(malicious)    │
-                                                     └─────────────────┘
+┌─────────────────┐     ┌──────────────┐     ┌──────────────────┐     ┌──────────┐
+│  Python Source   │────▶│  lightweight │────▶│  CodeBERT + PyG  │────▶│  GNN     │
+│  (.py file)      │     │  CPG (pure   │     │  Data (768-dim)  │     │  Layers  │
+└─────────────────┘     │  Python)    │     └──────────────────┘     └────┬─────┘
+                         └──────────────┘                                       │
+                                                                   ┌────────────▼────┐
+                                                                   │  Sigmoid Output  │
+                                                                   │  P(malicious)    │
+                                                                   └─────────────────┘
 ```
 
 ## Installation
 
 ### Prerequisites
 - **Python 3.10+**
-- **Java 11+** (required by Joern CPG extractor)
-- **Joern CLI** (v4.0+)
+- No Java / Joern required for default usage (optional Joern fallback still supported)
 
 ### Quick Start
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/semantic-cpg-backdoor-detector.git
-cd semantic-cpg-backdoor-detector
+git clone https://github.com/Bryn018/Semantic-Backdoor-Detector.git
+cd Semantic-Backdoor-Detector
 
 # Create virtual environment
 python3 -m venv .venv
@@ -53,60 +54,54 @@ source .venv/bin/activate
 
 # Install Python dependencies
 pip install -r requirements.txt
-
-# Install Joern (if not already installed)
-curl -L https://github.com/joernio/joern/releases/latest/download/joern-install.sh | bash
-```
-
-### Installing Joern Manually
-```bash
-# Download and extract to ~/bin/joern
-mkdir -p ~/bin/joern
-cd /tmp
-curl -L -o joern-cli.zip https://github.com/joernio/joern/releases/latest/download/joern-cli.zip
-unzip joern-cli.zip -d ~/bin/joern
-chmod -R +x ~/bin/joern/
-
-# Set environment variables (add to ~/.bashrc)
-export JAVA_HOME=$HOME/.local/jdk/jdk-21.0.5+11
-export PATH=$JAVA_HOME/bin:$PATH
 ```
 
 ## Usage
 
+### Command Line
+
 ```bash
 # Analyze a single file
-python infer.py --target /path/to/suspicious_file.py
+python explain.py --target /path/to/suspicious_file.py
 
-# With custom threshold
-python infer.py --target /path/to/file.py --threshold 0.7
+# JSON output for automation / pipelines
+python explain.py --target /path/to/file.py --json
 ```
+
+### Web UI (Gradio)
+
+```bash
+python app.py
+```
+
+Then open `http://localhost:7860` and paste Python source into the textbox.
 
 ### Example Output — Malicious File
-```
-  ╔══════════════════════════════════════════════════════════╗
-  ║       Semantic CPG Backdoor Detector v1.0               ║
-  ╚══════════════════════════════════════════════════════════╝
 
-  [+] Loaded vocabulary: 16 node types
-  [+] Loaded model: model.pth (18097 bytes)
-  [*] Extracting Code Property Graph from backdoor.py ...
-  [+] CPG extracted: 79 nodes, 231 edges
-  [*] Running GNN inference ...
-
-  [!] Analyzing: backdoor.py
-  [+] Nodes extracted: 79 | Edges: 231
-
-  [!!!] VERDICT: MALICIOUS (89.7% confidence)
-
-  [!] The GNN detected semantic patterns consistent with
-      obfuscated backdoor code (base64-encoded command execution,
-      reverse shells, data exfiltration, or persistence mechanisms).
+```json
+{
+  "verdict": "MALICIOUS",
+  "confidence": 87.6,
+  "explanation_nodes": [
+    {"score": 0.8421, "code": "_decode_payload", "type": "METHOD"},
+    {"score": 0.7214, "code": "base64.b64decode", "type": "CALL"}
+  ],
+  "explanation_flows": [
+    "encoded_cmd flows into base64.b64decode",
+    "decoded_result flows into os.system"
+  ]
+}
 ```
 
 ### Example Output — Benign File
-```
-  [✓] VERDICT: BENIGN (92.3% confidence)
+
+```json
+{
+  "verdict": "BENIGN",
+  "confidence": 99.7,
+  "explanation_nodes": [],
+  "explanation_flows": []
+}
 ```
 
 ## Included Model
@@ -115,11 +110,11 @@ The repository includes a pre-trained model:
 
 | File | Description |
 |------|-------------|
-| `model.pth` | Trained GNN weights (3,713 parameters, 18KB) |
-| `vocab.json` | Global node-type vocabulary (16 CPG node types) |
-| `dataset.pt` | Full training dataset (60 graphs) |
+| `model.pth` | Trained GNN weights (214,369 parameters, ~860KB) |
+| `vocab.json` | Global node-type vocabulary (15 CPG node types) |
+| `embedding_cache.json` | Cached CodeBERT embeddings (auto-generated) |
 
-**Out of the box**, you can run `python infer.py --target <file.py>` on any Python file.
+**Out of the box**, you can run `python explain.py --target <file.py>` on any Python file.
 
 ## Training
 
@@ -130,7 +125,7 @@ To train on your own dataset:
 python generate_dataset.py
 
 # Re-train the model
-python train.py --epochs 50 --lr 0.001
+python train_v2.py
 ```
 
 ## Dataset
@@ -139,6 +134,28 @@ The included training set has 60 files:
 - **30 benign**: Math utilities, string manipulation, file I/O, data processing
 - **30 malicious**: `os.system` + base64, reverse shells, `subprocess.call`, data exfiltration, cron persistence
 
+## CPG Backends
+
+| Backend | Environment | Notes |
+|---------|-------------|-------|
+| `lightweight` (default) | Pure Python | Uses `ast` + `networkx`. No JVM required. Fast. |
+| `joern` | Optional fallback | Set `CPG_BACKEND=joern`. Requires Java + Joern CLI. |
+
+```bash
+# Force Joern backend
+CPG_BACKEND=joern python explain.py --target file.py
+```
+
+## CI/CD
+
+This repository ships a GitHub Actions workflow that automatically deploys `app.py`, `Dockerfile`, `explain.py`, `gnn_model_v2.py`, `embedder.py`, `model.pth`, `vocab.json`, and `requirements.txt` to the Hugging Face Space on every push to `master`.
+
+Required secret: `HF_TOKEN` (user access token with `write` scope on the target Space).
+
+## Hugging Face Space
+
+Live demo: [swertay/semantic-backdoor-detector](https://huggingface.co/spaces/swertay/semantic-backdoor-detector)
+
 ## Requirements
 
 See [requirements.txt](requirements.txt):
@@ -146,7 +163,8 @@ See [requirements.txt](requirements.txt):
 torch>=2.0
 torch_geometric>=2.0
 networkx>=3.0
-py4j>=0.10
+transformers>=4.0
+gradio>=4.0
 ```
 
 ## License
