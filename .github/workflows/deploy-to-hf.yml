@@ -2,23 +2,52 @@ name: Deploy to Hugging Face
 on:
   push:
     branches: [master, main]
+  workflow_dispatch:
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Deploy to Space
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install huggingface_hub
+      - name: Deploy explicit files to Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          pip install huggingface_hub
-          python -c "
+          python << 'PYEOF'
+          import os
           from huggingface_hub import HfApi
+          repo_id = "swertay/semantic-backdoor-detector"
+          token = os.environ.get("HF_TOKEN")
+          if not token:
+              raise ValueError("HF_TOKEN secret is missing! Go to GitHub Settings -> Secrets and add HF_TOKEN.")
           api = HfApi()
-          api.upload_folder(
-              folder_path='./',
-              repo_id='swertay/semantic-backdoor-detector',
-              repo_type='space',
-              ignore_patterns=['.git*', 'dataset*', 'embedding_cache*', 'test_samples*', 'github_action*', 'infer.py', 'train*', 'build_pyg*', 'generate_dataset*', 'README.md', 'LICENSE']
-          )
-          "
+          files_to_upload = [
+              "app.py",
+              "Dockerfile",
+              "explain.py",
+              "gnn_model_v2.py",
+              "embedder.py",
+              "model.pth",
+              "vocab.json",
+              "requirements.txt",
+              ".gitignore"
+          ]
+          for f in files_to_upload:
+              if not os.path.exists(f):
+                  print(f"WARNING: {f} not found in repo, skipping.")
+                  continue
+              print(f"Uploading {f}...")
+              api.upload_file(
+                  path_or_fileobj=f,
+                  path_in_repo=f,
+                  repo_id=repo_id,
+                  repo_type="space",
+                  token=token
+              )
+          print("SUCCESS: All files deployed to Hugging Face Space!")
+          PYEOF
