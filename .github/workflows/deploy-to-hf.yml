@@ -1,0 +1,24 @@
+name: Deploy to Hugging Face
+on:
+  push:
+    branches: [master, main]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy to Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          pip install huggingface_hub
+          python -c "
+          from huggingface_hub import HfApi
+          api = HfApi()
+          api.upload_folder(
+              folder_path='./',
+              repo_id='swertay/semantic-backdoor-detector',
+              repo_type='space',
+              ignore_patterns=['.git*', 'dataset*', 'embedding_cache*', 'test_samples*', 'github_action*', 'infer.py', 'train*', 'build_pyg*', 'generate_dataset*', 'README.md', 'LICENSE']
+          )
+          "
