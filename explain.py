@@ -2,16 +2,8 @@
 """
 explain.py — Semantic CPG Backdoor Detector with GNNExplainer.
 
-Analyzes a Python source file for obfuscated backdoor patterns using
-CodeBERT + GNN, then explains WHY the model flagged it using
-PyTorch Geometric's GNNExplainer.
-
-Usage:
-    python explain.py --target <path_to_python_file>
-
-Core API:
-    result = analyze_code("suspicious.py")
-    # Returns dict with verdict, confidence, explanation_nodes, explanation_flows
+Default path: lightweight CPG -> CodeBERT -> SemanticBackdoorGNN -> GNNExplainer.
+Optional Joern fallback is available only when explicitly enabled via CLI.
 """
 
 from __future__ import annotations
@@ -22,9 +14,6 @@ import json
 import logging
 import networkx as nx
 import os
-import re
-import shutil
-import subprocess
 import sys
 import tempfile
 import traceback
@@ -52,7 +41,13 @@ JAVA_HOME = Path(
 )
 
 # Actionable node types — code elements a developer can act on
-ACTIONABLE_TYPES: set[str] = {"CALL", "IDENTIFIER", "LITERAL", "METHOD_PARAMETER_IN", "CONTROL_STRUCTURE"}
+ACTIONABLE_TYPES: set[str] = {
+    "CALL",
+    "IDENTIFIER",
+    "LITERAL",
+    "METHOD_PARAMETER_IN",
+    "CONTROL_STRUCTURE",
+}
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
 logger = logging.getLogger("explain")
@@ -75,20 +70,35 @@ def _generate_cpg_locally(code_string: str) -> dict:
     try:
         tree = ast.parse(code_string)
     except SyntaxError as exc:
-        return {"nodes": [{"id": 0, "code": f"PARSE_ERROR: {exc}", "label": "UNKNOWN"}], "edges": []}
+        return {
+            "nodes": [{"id": 0, "code": f"PARSE_ERROR: {exc}", "label": "UNKNOWN"}],
+            "edges": [],
+        }
 
     graph = nx.DiGraph()
     label_map = {
-        ast.FunctionDef: "METHOD", ast.AsyncFunctionDef: "METHOD", ast.ClassDef: "TYPE_DECL",
-        ast.Call: "CALL", ast.Name: "IDENTIFIER", ast.Constant: "LITERAL",
-        ast.arg: "METHOD_PARAMETER_IN", ast.If: "CONTROL_STRUCTURE", ast.For: "CONTROL_STRUCTURE",
-        ast.While: "CONTROL_STRUCTURE", ast.With: "CONTROL_STRUCTURE",
-        ast.Return: "RETURN", ast.Assign: "LOCAL", ast.AnnAssign: "LOCAL",
-        ast.Import: "IMPORT", ast.ImportFrom: "IMPORT", ast.Module: "MODULE",
+        ast.FunctionDef: "METHOD",
+        ast.AsyncFunctionDef: "METHOD",
+        ast.ClassDef: "TYPE_DECL",
+        ast.Call: "CALL",
+        ast.Name: "IDENTIFIER",
+        ast.Constant: "LITERAL",
+        ast.arg: "METHOD_PARAMETER_IN",
+        ast.If: "CONTROL_STRUCTURE",
+        ast.For: "CONTROL_STRUCTURE",
+        ast.While: "CONTROL_STRUCTURE",
+        ast.With: "CONTROL_STRUCTURE",
+        ast.Return: "RETURN",
+        ast.Assign: "LOCAL",
+        ast.AnnAssign: "LOCAL",
+        ast.Import: "IMPORT",
+        ast.ImportFrom: "IMPORT",
+        ast.Module: "MODULE",
         ast.Attribute: "IDENTIFIER",
     }
+
     def _label(node: ast.AST) -> str:
-        for typ, label in label_map.items():
+        for typ, label in label_map.items():  # type: ignore[assignment]
             if isinstance(node, typ):
                 return label
         return "UNKNOWN"
@@ -99,7 +109,7 @@ def _generate_cpg_locally(code_string: str) -> dict:
         if isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute):
-                val = getattr(func.value, 'id', None) or ast.dump(func.value)
+                val = getattr(func.value, "id", None) or ast.dump(func.value)
                 return f"{val}.{func.attr}"
             if isinstance(func, ast.Name):
                 return func.id
@@ -111,7 +121,10 @@ def _generate_cpg_locally(code_string: str) -> dict:
         if isinstance(node, ast.Import):
             return "import " + ", ".join(a.name for a in node.names)
         if isinstance(node, ast.ImportFrom):
-            return f"from {node.module or ''} import " + ", ".join(a.name for a in node.names)
+            return (
+                f"from {node.module or ''} import "
+                + ", ".join(a.name for a in node.names)
+            )
         if isinstance(node, (ast.If, ast.For, ast.While, ast.With, ast.Return)):
             return type(node).__name__.upper()
         if isinstance(node, ast.Assign):
@@ -122,7 +135,7 @@ def _generate_cpg_locally(code_string: str) -> dict:
 
     defs: dict[str, int] = {}
 
-    def add(parent_gid: int | None, node: ast.AST) -> int:
+    def add(parent_gid: Optional[int], node: ast.AST) -> int:
         gid = len(graph.nodes)
         label = _label(node)
         code = _code(node)
@@ -146,13 +159,29 @@ def _generate_cpg_locally(code_string: str) -> dict:
     for top in tree.body:
         add(None, top)
 
-    nodes = [{"id": n, "code": d.get("code", ""), "label": d.get("label", "UNKNOWN")} for n, d in graph.nodes(data=True)]
-    edges = [{"src": u, "dst": v, "label": d.get("label", "AST")} for u, v, d in graph.edges(data=True)]
+    nodes = [
+        {"id": n, "code": d.get("code", ""), "label": d.get("label", "UNKNOWN")}
+        for n, d in graph.nodes(data=True)
+    ]
+    edges = [
+        {"src": u, "dst": v, "label": d.get("label", "AST")}
+        for u, v, d in graph.edges(data=True)
+    ]
     return {"nodes": nodes, "edges": edges}
 
 
-def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
-    """Extract CPG from Python source, using pure-Python ast backend."""
+def extract_cpg(
+    py_file: Path,
+    output_json: Path,
+    use_joern: bool = False,
+) -> Optional[dict]:
+    """Extract CPG from Python source.
+
+    Args:
+        py_file: Python source file.
+        output_json: Destination JSON path.
+        use_joern: If True, prefer Joern when lightweight CPG yields no nodes.
+    """
     try:
         code_string = py_file.read_text(encoding="utf-8")
     except Exception as exc:
@@ -164,94 +193,32 @@ def extract_cpg(py_file: Path, output_json: Path) -> Optional[dict]:
             json.dump(graph, f, indent=2)
         return graph
 
+    if use_joern:
+        return _generate_cpg_with_joern(py_file, output_json)
+
     return {"_cpg_error": "CPG generation produced no nodes"}
 
-    pysrc2cpg = JOERN_DIR / "frontends" / "pysrc2cpg" / "bin" / "pysrc2cpg"
-    joern_export = JOERN_DIR / "bin" / "joern-export"
 
-    if not pysrc2cpg.is_file():
-        msg = f"Joern pysrc2cpg not found at {pysrc2cpg}"
-        logger.error(msg)
-        return {"_cpg_error": msg}
-
-    tmp_cpg = Path(tempfile.gettempdir()) / f"cpg_explain_{os.getpid()}.bin"
-    export_dir = Path(tempfile.gettempdir()) / f"dot_explain_{os.getpid()}"
-
+def _generate_cpg_with_joern(
+    py_file: Path,
+    output_json: Path,
+) -> Optional[dict]:
+    """Optional Joern-based CPG extraction."""
     try:
-        if tmp_cpg.is_file():
-            tmp_cpg.unlink()
-        if export_dir.exists():
-            shutil.rmtree(export_dir)
-
-        result = subprocess.run(
-            [str(pysrc2cpg), str(py_file), "-o", str(tmp_cpg)],
-            capture_output=True, text=True, timeout=120, env=joern_env(),
-        )
-        if result.returncode != 0 or not tmp_cpg.is_file():
-            logger.error("pysrc2cpg failed: %s", result.stderr[:200])
-            error_detail = f"pysrc2cpg failed:\n{result.stderr}"
-            return {"_cpg_error": error_detail}
-
-        result = subprocess.run(
-            [str(joern_export), str(tmp_cpg), "--out", str(export_dir),
-             "--repr", "cpg", "--format", "dot"],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(joern_export.parent), env=joern_env(),
-        )
-        if result.returncode != 0:
-            logger.error("joern-export failed: %s", result.stderr[:200])
-            error_detail = f"joern-export failed:\n{result.stderr}"
-            return {"_cpg_error": error_detail}
-
-        all_nodes: dict[int, dict] = {}
-        all_edges: list[dict] = []
-        node_re = re.compile(r'"(\d+)"\s*\[([^\]]+)\]')
-        edge_re = re.compile(r'"(\d+)"\s*->\s*"(\d+)"\s*\[([^\]]+)\]')
-        attr_re = re.compile(r'(\w+)="([^"]*)"')
-
-        for dot_file in export_dir.rglob("export.dot"):
-            content = dot_file.read_text(encoding="utf-8")
-            for m in node_re.finditer(content):
-                nid = int(m.group(1))
-                attrs = dict(attr_re.findall(m.group(2)))
-                if nid not in all_nodes:
-                    all_nodes[nid] = {"id": nid, **attrs}
-            for m in edge_re.finditer(content):
-                attrs = dict(attr_re.findall(m.group(3)))
-                all_edges.append({
-                    "src": int(m.group(1)), "dst": int(m.group(2)), **attrs,
-                })
-
-        if not all_nodes:
-            return None
-
-        graph = {"nodes": list(all_nodes.values()), "edges": all_edges}
-        with open(output_json, "w", encoding="utf-8") as f:
-            json.dump(graph, f, indent=2)
-        return graph
-
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        msg = f"{'Joern' if error_detail is None else 'CPG'} extraction failed:\n{traceback.format_exc()}"
-        return {"_cpg_error": msg}
-    finally:
-        if tmp_cpg.is_file():
-            tmp_cpg.unlink()
-        if export_dir.exists():
-            shutil.rmtree(export_dir, ignore_errors=True)
+        from cpg_generator import generate_cpg as generate_cpg_joern
+        return generate_cpg_joern(py_file, output_json)
+    except Exception as exc:
+        logger.error("Joern fallback failed: %s", exc)
+        return {"_cpg_error": f"CPG extraction failed: {exc}"}
 
 
 # ---------------------------------------------------------------------------
 # Core Analysis API
 # ---------------------------------------------------------------------------
 
+
 def analyze_code(file_path_or_code: str) -> dict:
     """Analyze a Python file for backdoor patterns with full explainability.
-
-    Extracts a Code Property Graph, embeds nodes with CodeBERT, runs the
-    SemanticBackdoorGNN, and uses GNNExplainer to identify the specific
-    code elements that drove the verdict.
-
-    Accepts either a file path (CLI) or raw Python code string (Gradio UI).
 
     Args:
         file_path_or_code: Path to the Python source file, OR raw Python code string.
@@ -273,12 +240,10 @@ def analyze_code(file_path_or_code: str) -> dict:
     """
     temp_py_path = None
 
-    # Check if input is a file path or raw code string
-    if os.path.exists(file_path_or_code) and file_path_or_code.endswith('.py'):
+    if os.path.exists(file_path_or_code) and file_path_or_code.endswith(".py"):
         py_file = Path(file_path_or_code)
     else:
-        # Input is raw code from Gradio UI, save to temp file
-        temp_py = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False)
+        temp_py = tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False)
         temp_py.write(file_path_or_code)
         temp_py.close()
         temp_py_path = temp_py.name
@@ -302,7 +267,11 @@ def analyze_code(file_path_or_code: str) -> dict:
                 tmp_json.unlink()
 
         if graph is None or (isinstance(graph, dict) and "_cpg_error" in graph):
-            error_msg = graph.get("_cpg_error", "CPG extraction failed") if isinstance(graph, dict) else "CPG extraction failed"
+            error_msg = (
+                graph.get("_cpg_error", "CPG extraction failed")
+                if isinstance(graph, dict)
+                else "CPG extraction failed"
+            )
             return {
                 "verdict": "ERROR",
                 "confidence": 0.0,
@@ -315,7 +284,6 @@ def analyze_code(file_path_or_code: str) -> dict:
         x_np = embed_graph_nodes(graph)
         x = torch.from_numpy(x_np).float()
 
-        # Build mappings
         index_to_code: dict[int, str] = {}
         index_to_label: dict[int, str] = {}
         id_map: dict[int, int] = {}
@@ -375,37 +343,34 @@ def analyze_code(file_path_or_code: str) -> dict:
         if edge_mask.dim() > 1:
             edge_mask = edge_mask.squeeze(-1)
 
-        # --- FILTER: Only actionable nodes with score > 0.25 ---
         actionable_nodes: list[dict] = []
         actionable_indices: set[int] = set()
 
         for idx in range(len(graph["nodes"])):
             label = index_to_label.get(idx, "")
             score = node_mask[idx].item()
-
             if label not in ACTIONABLE_TYPES:
                 continue
             if score <= 0.25:
                 continue
-
             code_str = index_to_code.get(idx, "")
             if not code_str or code_str in ("?", "", "<empty>", "<module>", "<global>"):
                 continue
             if len(code_str.strip()) < 2:
                 continue
-
-            actionable_nodes.append({
-                "index": idx,
-                "score": round(score, 4),
-                "code": code_str,
-                "type": label,
-            })
+            actionable_nodes.append(
+                {
+                    "index": idx,
+                    "score": round(score, 4),
+                    "code": code_str,
+                    "type": label,
+                }
+            )
             actionable_indices.add(idx)
 
         actionable_nodes.sort(key=lambda n: n["score"], reverse=True)
         top_nodes = actionable_nodes[:3]
 
-        # --- FILTER: Only edges where BOTH src and dst are actionable ---
         explanation_flows: list[str] = []
         if edge_mask.dim() == 1:
             for e_idx in range(edge_mask.size(0)):
@@ -416,13 +381,11 @@ def analyze_code(file_path_or_code: str) -> dict:
                     src_idx = data.edge_index[0, e_idx].item()
                     dst_idx = data.edge_index[1, e_idx].item()
                     if src_idx in actionable_indices and dst_idx in actionable_indices:
-                        src_code = index_to_code.get(src_idx, "?")
-                        dst_code = index_to_code.get(dst_idx, "?")
                         explanation_flows.append(
-                            f"{src_code} flows into {dst_code}"
+                            f"{index_to_code.get(src_idx, '?')} flows into {index_to_code.get(dst_idx, '?')}"
                         )
 
-        result: dict = {
+        return {
             "verdict": verdict,
             "confidence": round(confidence, 1),
             "explanation_nodes": [
@@ -432,12 +395,9 @@ def analyze_code(file_path_or_code: str) -> dict:
             "explanation_flows": explanation_flows[:5],
         }
 
-        return result
-
     finally:
         if temp_py_path and os.path.exists(temp_py_path):
             os.remove(temp_py_path)
-
 
 
 def print_banner() -> None:
@@ -511,6 +471,8 @@ def main() -> int:
                         help="Path to the Python file to analyze.")
     parser.add_argument("--json", action="store_true",
                         help="Output raw JSON dictionary.")
+    parser.add_argument("--use-joern", action="store_true",
+                        help="Allow Joern fallback if lightweight CPG fails.")
     args = parser.parse_args()
 
     if not args.json:
